@@ -3,6 +3,7 @@
 # Author: Heresh Fattahi
 
 import os
+from pathlib import Path
 import glob
 import argparse
 import numpy as np
@@ -79,9 +80,7 @@ def writeToFile(data , ds , xoff, yoff):
 
     ds.GetRasterBand(1).WriteArray(data, xoff, yoff)
 
-
-    format = "ENVI"
-    driver = gdal.GetDriverByName(format)
+    driver = gdal.GetDriverByName("ENVI")
 
     [cols, rows] = ampDisp.shape
 
@@ -161,12 +160,31 @@ def getCoherence(dsTcor, psDataset, outDataset,
     return None
 
 
+def strip_all_ext(path):
+    extensions = "".join(Path(path).suffixes)
+    return Path(str(path).replace(extensions, ""))
+
+
+def get_stack_date_map(vrt_filename):
+    """Read in the dates and files contained in the bands of the VRT file."""
+    ds = gdal.Open(vrt_filename)
+    # The first file will be `vrt_filename`, the rest are the bands
+    file_list = gdal.Info(ds, format="json")["files"][1:]
+    ds = None
+    file_paths = [Path(f) for f in file_list]
+    dates = [str(strip_all_ext(f).stem) for f in file_paths]
+    filename_only = [str(f.name) for f in file_paths]
+    # mapping from date to filename
+    return {d: f for d, f in zip(dates, filename_only)}
+
+
 def main(iargs=None):
 
     inps = cmdLineParser(iargs)
 
     # Open the SLC dataset to read
     dsSlc = gdal.Open(inps.slcStack, gdal.GA_ReadOnly)
+
 
     # Open the tcorr dataset
     dsTcor = gdal.Open(inps.tcorrFile, gdal.GA_ReadOnly)
@@ -230,11 +248,11 @@ def main(iargs=None):
         print(pair)
     print(len(networkObj.pairsDates))
 
+    date_to_file = get_stack_date_map(inps.slcStack)
     # loop over all pairs
     for pair in networkObj.pairsDates:
 
-        date_i = pair.split('-')[0]
-        date_j = pair.split('-')[1]
+        date_i, date_j = pair.split('-')
 
         band_i = dateList.index(date_i) + 1
         band_j = dateList.index(date_j) + 1
@@ -246,8 +264,10 @@ def main(iargs=None):
         driver = gdal.GetDriverByName("ENVI")
         outDataset = driver.Create(outName, ncols, nrows, 1, gdal.GDT_CFloat32)
 
-        dsDS_band_i = gdal.Open(os.path.join(inps.dsStackDir, date_i + ".slc.vrt"), gdal.GA_ReadOnly)
-        dsDS_band_j = gdal.Open(os.path.join(inps.dsStackDir, date_j + ".slc.vrt"), gdal.GA_ReadOnly)
+        file_i = date_to_file[date_i]
+        file_j = date_to_file[date_j]
+        dsDS_band_i = gdal.Open(os.path.join(inps.dsStackDir, file_i), gdal.GA_ReadOnly)
+        dsDS_band_j = gdal.Open(os.path.join(inps.dsStackDir, file_j), gdal.GA_ReadOnly)
 
         # integrate PS to DS for this pair and write to file block by block
         integratePS2DS(dsDS_band_i, dsDS_band_j, dsSlc, dsTcor, psDataset, outDataset,
