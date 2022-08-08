@@ -118,6 +118,8 @@ def integratePS2DS(dsDS_band_i, dsDS_band_j, dsSlc, dsTcor, psDataset, outDatase
         band_i_DS = dsDS_band_i.ReadAsArray(x0, y0, xoff, yoff)
         band_j_DS = dsDS_band_j.ReadAsArray(x0, y0, xoff, yoff)
 
+        # Get the original single-look ifg (so that we can grab the PS pixels)
+        # TODO: Should I just get the PS pixels from the original SLCs? Save space?
         ifgram = get_fullres_ifgram(dsSlc, band_i, band_j, x0, y0, xoff, yoff)
 
         # pair i-j of DS pixels
