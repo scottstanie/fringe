@@ -1,26 +1,38 @@
 #!/usr/bin/env python3
-
-from array import array
 import datetime
 import glob
+import itertools
 import os
 import re
+from array import array
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
+import pandas as pd
+from numba import njit
 from osgeo import gdal
 
+
+@njit(cache=True)
 def simulate_noise(corr_matrix: np.array) -> np.array:
     N = corr_matrix.shape[0]
 
     w, v = np.linalg.eigh(corr_matrix)
     w[w < 1e-3] = 0.0
+    w = w.astype(v.dtype)
 
-    C = np.dot(v, np.dot(np.diag(np.sqrt(w)), np.matrix.getH(v)))
-    Z = (np.random.randn(N) + 1j * np.random.randn(N)) / np.sqrt(2)
-    slc = np.dot(C, Z)
+    vstar = np.conj(v.T)  # Hermetian
+    C = v @ np.diag(np.sqrt(w)) @ vstar
+    z = (np.random.randn(N) + 1j * np.random.randn(N)) / np.sqrt(2)
+    z = z.astype(C.dtype)
+    return C @ z
+    # slc = np.dot(C, z)
 
-    return slc
 
-def simulate_neighborhood_stack(corr_matrix: np.array, neighbor_samples: int = 200) -> np.array:
+@njit(cache=True)
+def simulate_neighborhood_stack(
+    corr_matrix: np.array, neighbor_samples: int = 200
+) -> np.array:
 
     nslc = corr_matrix.shape[0]
     # A 2D matrix for a neighborhood over time.
@@ -30,11 +42,12 @@ def simulate_neighborhood_stack(corr_matrix: np.array, neighbor_samples: int = 2
         slcs = simulate_noise(corr_matrix)
         # To ensure that the neighborhood is homogeneous,
         # we set the amplitude of all SLCs to one
-        neighbor_stack[:, ii] = np.exp(1J*np.angle(slcs))
+        neighbor_stack[:, ii] = np.exp(1j * np.angle(slcs))
 
     return neighbor_stack
 
 
+@njit(cache=True)
 def simulate_coherence_matrix(t, gamma0, gamma_inf, Tau0, ph):
     length = t.shape[0]
     C = np.ones((length, length), dtype=np.complex64)
@@ -47,9 +60,14 @@ def simulate_coherence_matrix(t, gamma0, gamma_inf, Tau0, ph):
     return C
 
 
-def simulate_phase_timeSeries(
-        time_series_length: int = 365, acquisition_interval: int = 12, signal_rate: float = 1.0, std_random: float = 0, k: int = 1
-        ):
+@njit(cache=True)
+def simulate_phase_timeseries(
+    time_series_length: int = 365,
+    acquisition_interval: int = 12,
+    signal_rate: float = 1.0,
+    std_random: float = 0,
+    k: int = 1,
+):
     # time_series_length: length of time-series in days
     # acquisition_interval: time-differense between subsequent acquisitions (days)
     # signal_rate: linear rate of the signal (rad/year)
@@ -69,6 +87,7 @@ def simulate_phase_timeSeries(
     return signal_phase, t
 
 
+@njit(cache=True)
 def covariance(c1, c2):
 
     a1 = np.sum(np.abs(c1) ** 2)
@@ -78,6 +97,7 @@ def covariance(c1, c2):
     return cov
 
 
+@njit(cache=True)
 def compute_covariance_matrix(neighbor_stack):
     nslc = neighbor_stack.shape[0]
     cov_mat = np.zeros((nslc, nslc), dtype=np.complex64)
@@ -91,6 +111,7 @@ def compute_covariance_matrix(neighbor_stack):
     return cov_mat
 
 
+@njit(cache=True)
 def estimate_evd(cov_mat):
 
     # estimate the wrapped phase based on the eigen value decomposition of the covariance matrix
@@ -110,25 +131,254 @@ def estimate_evd(cov_mat):
     return evd_estimate
 
 
+@njit(cache=True)
+def estimate_temp_coh(est, cov_matrix):
+    gamma = 0
+    N = len(est)
+    count = 0
+    for i in range(N):
+        for j in range(i + 1, N):
+            theta = np.angle(cov_matrix[i, j])
+            phi = np.angle(est[i] * np.conj(est[j]))
+
+            gamma += np.exp(1j * theta) * np.exp(-1j * phi)
+            count += 1
+    # assert count == (N * (N - 1)) / 2
+    return np.abs(gamma) / count
+
+
+# # TODO
+# @njit(cache=True)
+# def estimate_temp_coh_unbiased(est, cov_matrix):
+#     # TODO
+#     gamma = 0
+#     N = len(est)
+#     count = 0
+#     for i in range(N):
+#         for j in range(i + 1, N):
+#             theta = np.angle(cov_matrix[i, j])
+#             phi = np.angle(est[i] * np.conj(est[j]))
+
+#             gamma += np.exp(1j * theta) * np.exp(-1j * phi)
+#             count += 1
+#     # assert count == (N * (N - 1)) / 2
+#     return np.abs(gamma) / count
+
+
+@njit(cache=True)
+def getC(
+    gamma_inf=0.1,
+    gamma0=0.999,
+    Tau0=72,
+    num_acq=31,
+    acq_interval=12,
+    add_signal=False,
+):
+    time_series_length = num_acq * acq_interval + 1
+    if add_signal:
+        k, std_random, signal_rate = 1, 0.3, 2
+    else:
+        k, std_random, signal_rate = 0, 0, 0
+    signal_phase, t = simulate_phase_timeseries(
+        time_series_length=time_series_length,
+        acquisition_interval=acq_interval,
+        signal_rate=signal_rate,
+        std_random=std_random,
+        k=k,
+    )
+    # simulated_covariance_matrix = simulate_coherence_matrix(
+    C = simulate_coherence_matrix(t, gamma0, gamma_inf, Tau0, signal_phase)
+    return C
+
+
+@njit(cache=True)
+def simulate_temp_coh(C, neighbor_samples=11 * 11) -> np.ndarray:
+
+    # simulate a complex covraince matrix based on the
+    # simulated phase and coherence model
+    # if C is None:
+    # simulate ideal wrapped phase series without noise and without any short lived signals
+
+    # simulate a neighborhood of SLCs with size of
+    # neighbor_samples for Nt acquisitions
+    neighbor_stack = simulate_neighborhood_stack(C, neighbor_samples=neighbor_samples)
+
+    # estimate complex covariance matrix from the neighbor stack
+    C_hat = compute_covariance_matrix(neighbor_stack)
+
+    # estimate wrapped phase with a prototype estimator of EVD
+    evd_estimate = estimate_evd(C_hat)
+
+    # Return both the temp coherence using (estimated C, true C):
+    return estimate_temp_coh(evd_estimate, C_hat), estimate_temp_coh(evd_estimate, C)
+
+
+# def _run_cur(ns, curC, combo):
+def _run_cur(trip):
+    ns, curC, combo = trip
+    # num_acq, Tau0, gamma_inf, gamma0, ns, nrepeat = combo
+    # num_acq, Tau0, gamma_inf, gamma0, ns, idx = combo
+    # num_acq, Tau0, gamma_inf, gamma0, ns, curC = combo
+    num_acq, Tau0, gamma_inf, gamma0 = combo
+
+    # return [
+    return (
+        num_acq,
+        Tau0,
+        gamma_inf,
+        gamma0,
+        ns,
+        *simulate_temp_coh(
+            curC,
+            neighbor_samples=ns,
+        ),
+    )
+    # for _ in range(nrepeat)
+    # ]
+
+def _run_cur_n(trip_n):
+    return [_run_cur(trip) for trip in trip_n]
+
+
+def _get_all_cov_matrices(cov_combos):
+    return [
+        getC(
+            gamma_inf=gamma_inf,
+            gamma0=gamma0,
+            Tau0=Tau0,
+            num_acq=num_acq,
+            add_signal=False,
+        )
+        for (num_acq, Tau0, gamma_inf, gamma0) in cov_combos
+    ]
+
+
+def run_simulation(
+    outname="sim.csv",
+    num_acq_arr=[20],
+    Tau0_arr=[1.0],
+    gamma_inf_arr=[0.01],
+    gamma0_arr=[0.01],
+    n_samples_arr=[50],
+    nrepeat=1000,
+    max_workers=10,
+):
+    os.environ["OPENBLAS_NUM_THREADS"] = "6"
+
+    outputs = []
+    columns = "num_acq, Tau0, gamma_inf, gamma0, ns".split(", ")
+    print(columns)
+    cov_combos = list(itertools.product(num_acq_arr, Tau0_arr, gamma_inf_arr, gamma0_arr))
+    C_arr = _get_all_cov_matrices(cov_combos)
+
+    # num_acq_arr, Tau0_arr, gamma_inf_arr, gamma0_arr, n_samples_arr, [nrepeat]
+    ns_C_pairs = list(itertools.product(
+        # num_acq_arr,
+        # Tau0_arr,
+        # gamma_inf_arr,
+        # gamma0_arr,
+        # # The previous 4 were iterated in the cov_combos
+        n_samples_arr,
+        range(len(C_arr)),
+        # C_arr,
+        # np.arange(nrepeat),
+    ))
+    print(len(ns_C_pairs), len(cov_combos))
+    ns_c_combos = [(a, C_arr[c_idx], cov_combos[c_idx]) for idx, (a, c_idx) in enumerate(ns_C_pairs)]
+    # nrepeat = 50
+    print(f"{len(ns_C_pairs)} ns_C_pairs, {len(cov_combos) = } {nrepeat} repeats")
+    if max_workers == 1:
+        # for (num_acq, Tau0, gamma_inf, gamma0, ns, _) in ns_C_pairs:
+        for ridx in range(nrepeat):
+            outs = []
+            print(f"{ridx}/{nrepeat}")
+            # outs = [_run_cur(ns, curC, combo) for (ns, curC, combo) in zip(*ns_C_pairs, cov_combos)]
+            outs = [_run_cur((ns, curC, combo)) for (ns, curC, combo) in ns_c_combos]
+            np.save(f"r{ridx}.npy", np.array(outs))
+    else:
+        repeating_trips = itertools.repeat(ns_c_combos, nrepeat)
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # executor.map(_run_cur, repeating_trips)
+            future_list = [executor.submit(_run_cur_n, trip) for trip in repeating_trips]
+            for future in as_completed(future_list):
+            # future_to_combo = {
+            #     executor.submit(_run_cur, combo): combo for combo in combos
+            # }
+            # for future in as_completed(future_to_combo):
+                # combo = future_to_combo[future]
+                # print(combo)
+                results = future.result()
+                # outputs.extend(results)
+                outputs.extend(results)
+
+    print(np.array(outputs).shape)
+    df_low_coh = pd.DataFrame(
+        data=outputs, columns=columns + ["tcoh_C_hat", "tcoh_C_true"]
+    )
+    df_low_coh.to_csv(outname, index=False)
+    return df_low_coh
+
+
+import sys
+
+
+def test_low_coh():
+    mw = int(sys.argv[1])
+    num_acq_arr = [5, 15, 30, 60, 90]
+    samples_arr = [20, 50, 100, 200, 500]
+    # num_acq_arr = [5, 15, 30]
+    # samples_arr = [20, 50, 100]
+    gamma_inf_arr = [0.00]
+    gamma0_arr = [0.00]
+    # Tau0_arr = [1.0]
+    # return run_simulation(max_workers=mw)
+    return run_simulation(
+        outname="sim_low_coh.csv",
+        num_acq_arr=num_acq_arr,
+        gamma_inf_arr=gamma_inf_arr,
+        gamma0_arr=gamma0_arr,
+        n_samples_arr=samples_arr,
+        max_workers=mw,
+    )
+
+
+def test_exp_coh():
+    mw = int(sys.argv[1])
+    num_acq_arr = [5, 15, 30, 60, 90]
+    samples_arr = [20, 50, 100, 200]  # , 500]
+    # num_acq_arr = [5, 15, 30]
+    # samples_arr = [20, 50, 100]
+    gamma_inf_arr = [0.0]
+    gamma0_arr = [0.99, 0.5]
+    Tau0_arr = [12.0, 72.0]
+    # return run_simulation(max_workers=mw)
+    return run_simulation(
+        outname="sim_exp_coh.csv",
+        num_acq_arr=num_acq_arr,
+        Tau0_arr=Tau0_arr,
+        gamma_inf_arr=gamma_inf_arr,
+        gamma0_arr=gamma0_arr,
+        n_samples_arr=samples_arr,
+        max_workers=mw,
+    )
+
+
 def simulate_bit_mask(ny, nx, filename="neighborhood_map"):
+    # flags = np.ones((ny, nx), dtype=np.bool_)
+    # flag_bits = np.zeros((ny, nx), dtype=np.uint8)
 
-    # number of uint32 bytes needed to store weights
-    number_of_bytes = np.ceil((ny * nx) / 32)
-
-    flags = np.ones((ny, nx), dtype=np.bool_)
-    flag_bits = np.zeros((ny, nx), dtype=np.uint8)
-
-    for ii in range(ny):
-        for jj in range(nx):
-            flag_bits[ii, jj] = flags[ii, jj].astype(np.uint8)
+    # for ii in range(ny):
+    #     for jj in range(nx):
+    #         flag_bits[ii, jj] = flags[ii, jj].astype(np.uint8)
 
     # create the weight dataset for 1 neighborhood
-    cols = nx
-    rows = ny
+    # number of uint32 bytes needed to store weights
+    number_of_bytes = np.ceil((ny * nx) / 32)
     n_bands = int(number_of_bytes)
+
     drv = gdal.GetDriverByName("ENVI")
     options = ["INTERLEAVE=BIP"]
-    ds = drv.Create(filename, cols, rows, n_bands, gdal.GDT_UInt32, options)
+    ds = drv.Create(filename, nx, ny, n_bands, gdal.GDT_UInt32, options)
 
     half_window_y = int(ny / 2)
     half_window_x = int(nx / 2)
@@ -272,7 +522,7 @@ def read_wrapped_phase(output_dir, x, y):
 def main():
 
     # simulate ideal wrapped phase series without noise and without any short lived signals
-    signal_phase, t = simulate_phase_timeSeries(
+    signal_phase, t = simulate_phase_timeseries(
         time_series_length=700,
         acquisition_interval=12,
         signal_rate=1,
@@ -337,7 +587,7 @@ def main():
     geometry_stack_dir = os.path.join(output_timeseries_dir, "geometry")
     slc_stack_dir = os.path.join(output_timeseries_dir, "slcs")
 
-    #create a VRT pointing to the stack
+    # create a VRT pointing to the stack
     cmd = f"tops2vrt.py -i {output_simulation_dir} -s {coreg_stack_dir} -g {geometry_stack_dir} -c {slc_stack_dir}"
     os.system(cmd)
 
@@ -381,7 +631,6 @@ def main():
     print("rmse for evd [degrees]:", np.degrees(rmse_evd))
     print("rmse for evd fringe [degrees]:", rmse_fringe_evd)
     print("rmse for mle fringe [degrees]:", rmse_fringe_mle)
-
 
     #######################
     # for debugging purpose
@@ -431,6 +680,9 @@ def main():
     # should be nx*ny
     assert count == nx * ny
 
+
 if __name__ == "__main__":
 
-    main()
+    # main()
+    test_low_coh()
+    # test_exp_coh()
