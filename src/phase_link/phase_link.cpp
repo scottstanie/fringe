@@ -69,21 +69,6 @@ int evd_process(evdOptions *opts) {
   std::cout << "Number of cols  = " << cols << "\n";
   std::cout << "Number of bands = " << nbands << "\n";
 
-  // Resolve method and bandwidth
-  if (opts->method.compare("STBAS") == 0) {
-    // If bandwidth is not provided
-    if (opts->bandWidth <= 0) {
-      std::cout << "Requested STBAS but no bandwidth provided \n";
-      GDALDestroyDriverManager();
-      return 101;
-    } else if (opts->bandWidth >= (nbands - 1)) {
-      std::cout << "Requested STBAS bandwidth " << opts->bandWidth
-                << " is larger than full bandwidth " << (nbands - 1) << "\n";
-      GDALDestroyDriverManager();
-      return 101;
-    }
-  }
-
   // Open weights file
   wtsDataset = reinterpret_cast<GDALDataset *>(
       GDALOpenShared(opts->wtsDS.c_str(), GA_ReadOnly));
@@ -473,8 +458,7 @@ int evd_process(evdOptions *opts) {
     // Copy method to constant string
     const std::string method = opts->method;
     const int BW = opts->bandWidth;
-    const bool isstbas = (method.compare("STBAS") == 0);
-    const bool ismle = (method.compare("MLE") == 0);
+    const bool is_mle = (method.compare("MLE") == 0);
 
 #pragma omp parallel for default(shared)
     for (int pp = (firstlinetowrite * cols);
@@ -651,8 +635,7 @@ int evd_process(evdOptions *opts) {
         std::complex<double> cJ(0.0, 1.0);
         int counter = 0;
         for (int ti = 0; ti < nbands; ti++) {
-          int ulim = isstbas ? (ti + BW + 1) : nbands;
-          for (int tj = ti + 1; tj < ulim; tj++) {
+          for (int tj = ti + 1; tj < nbands; tj++) {
             int ind = ti + nbands * tj;
 
             tempcorr += std::exp(cJ * (std::arg(Covar.at(ti, tj, threadnum)) -

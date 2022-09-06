@@ -60,8 +60,8 @@ def runEvd(inps):
     aa.minimumNeighbors = inps.minNeighbors
     
     ##Set up method and bandwidth
-    aa.method = inps.method
-    aa.bandWidth = inps.bandWidth
+    # aa.method = inps.method
+    # aa.bandWidth = inps.bandWidth
 
     aa.run()
 
